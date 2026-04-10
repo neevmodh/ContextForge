@@ -1,10 +1,111 @@
 
 import re
 from collections import Counter
-from transformers import AutoTokenizer
+from typing import Any
+
+import torch
+from transformers import AutoModel, AutoTokenizer
 
 
 """ Here is an example of implementation of Long-Context Data Annotation. """
+
+
+_SIM_TOKENIZER = None
+_SIM_MODEL = None
+_QWEN_TOKENIZER = None
+
+
+def _get_similarity_encoder(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Lazily initialize sentence-embedding encoder."""
+    global _SIM_TOKENIZER, _SIM_MODEL
+    if _SIM_TOKENIZER is None or _SIM_MODEL is None:
+        _SIM_TOKENIZER = AutoTokenizer.from_pretrained(model_name)
+        _SIM_MODEL = AutoModel.from_pretrained(model_name)
+        _SIM_MODEL.eval()
+    return _SIM_TOKENIZER, _SIM_MODEL
+
+
+def _get_qwen_tokenizer(model_name_or_path: str = "Qwen/Qwen3-4B"):
+    """Lazily initialize Qwen tokenizer for token-budget checks."""
+    global _QWEN_TOKENIZER
+    if _QWEN_TOKENIZER is None:
+        _QWEN_TOKENIZER = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    return _QWEN_TOKENIZER
+
+
+def _compact_long_text(text: str, max_chars: int = 2400) -> str:
+    """Keep long text compact for efficient embedding while preserving key context."""
+    if len(text) <= max_chars:
+        return text
+    head = text[: max_chars // 2]
+    tail = text[-(max_chars // 2) :]
+    return head + "\n...\n" + tail
+
+
+def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    summed = torch.sum(last_hidden_state * mask, dim=1)
+    counts = torch.clamp(mask.sum(dim=1), min=1e-9)
+    return summed / counts
+
+
+def _encode_texts(texts: list[str], batch_size: int = 32) -> torch.Tensor:
+    """Encode texts into normalized sentence embeddings."""
+    tokenizer, model = _get_similarity_encoder()
+    all_embeddings = []
+
+    with torch.inference_mode():
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            outputs = model(**inputs)
+            emb = _mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            all_embeddings.append(emb)
+
+    return torch.cat(all_embeddings, dim=0)
+
+
+def select_best_examples(input_text: str, dataset_examples: list[dict[str, Any]], top_k: int = 3) -> list[dict[str, Any]]:
+    """Select top-k most similar examples using cosine similarity on sentence embeddings.
+
+    This is efficient for long text by compacting content before encoding and
+    encoding examples in batches.
+    """
+    if not dataset_examples:
+        return []
+
+    valid_examples = [ex for ex in dataset_examples if isinstance(ex, dict) and "input" in ex]
+    if not valid_examples:
+        return []
+
+    top_k = max(1, min(top_k, len(valid_examples)))
+    query_text = _compact_long_text(str(input_text))
+    example_texts = [_compact_long_text(str(ex.get("input", ""))) for ex in valid_examples]
+
+    try:
+        query_emb = _encode_texts([query_text])
+        example_emb = _encode_texts(example_texts)
+        scores = torch.matmul(example_emb, query_emb.T).squeeze(1)
+        top_indices = torch.topk(scores, k=top_k).indices.tolist()
+        return [valid_examples[i] for i in top_indices]
+    except Exception:
+        # Fallback: lexical overlap score if embedding model is unavailable.
+        query_tokens = set(query_text.lower().split())
+        scored = []
+        for idx, ex_text in enumerate(example_texts):
+            ex_tokens = set(ex_text.lower().split())
+            union = len(query_tokens | ex_tokens) or 1
+            score = len(query_tokens & ex_tokens) / union
+            scored.append((score, idx))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [valid_examples[idx] for _, idx in scored[:top_k]]
 
 def build_prompt____(task_description: str, text2annotate: str) -> str:
     """
@@ -223,46 +324,34 @@ def select_examples(all_examples: list[dict], task_description: str, text2annota
         text2annotate:
             The text that needs to be annotated  which may be used for example retrieval.
     """
-    # 初始化Qwen3-4B的tokenizer（自动下载/加载千问3-4B的分词器）
-    # 若本地已下载模型，可替换为本地路径，如 "./qwen3-4b"
-    tokenizer = AutoTokenizer.from_pretrained("/share/project/wuhaiming/spaces/data_agent/OpenSeek-main/openseek/competition/LongContext-ICL-Annotation/src/Qwen3-4B", trust_remote_code=True)
-    
-    # 最大上下文长度限制（Qwen3-4B的上下文窗口默认是8k/32k，可根据实际调整）
-    target_length = 8192  # 若需严格适配Qwen3-4B，建议改为8192（8k）
-    
-    # print(all_examples[0])  # 打印第一个示例，便于调试
+    tokenizer = _get_qwen_tokenizer()
+    target_length = 8192
 
-    examples_str, token_num = "", 0
-    # 遍历所有示例，基于Qwen3-4B的tokenizer计算token数
-    for i, example in enumerate(all_examples):
+    # Use semantic retrieval to pick the most relevant 2-3 examples.
+    selected = select_best_examples(text2annotate, all_examples, top_k=3)
+    if len(selected) == 1 and len(all_examples) > 1:
+        selected = select_best_examples(text2annotate, all_examples, top_k=2)
+
+    examples_str = ""
+    token_num = 0
+    for i, example in enumerate(selected):
         try:
-            # 提取input和output（兼容output是列表的情况）
-            input_text = example['input']
-            output_text = example['output'][0]
-            
-            # 核心：用Qwen3-4B的tokenizer计算input+output的token数（替代原length键）
-            # encode返回token id列表，len即为token数
+            input_text = str(example["input"])
+            output_text = _extract_example_output(example)
+
             input_tokens = len(tokenizer.encode(input_text, add_special_tokens=False))
             output_tokens = len(tokenizer.encode(output_text, add_special_tokens=False))
-            length = input_tokens + output_tokens  # 等效原示例的length值
-            
-            # 校验当前示例是否能加入（总长度不超限制）
-            if length + token_num <= target_length:
-                # 累加总token数：示例文本长度 + 格式符号的token数（<label>2 + </label>3 + \n1 + #1）
-                # 注：格式符号的token数是原代码约定，Qwen3-4B对这些符号的实际编码可能略有差异，若需精准可改为：
-                # symbol_tokens = len(tokenizer.encode(f"# <label> </label>\n", add_special_tokens=False))
-                # token_num += (length + symbol_tokens)
-                token_num += (length + 2 + 3 + 1 + 1)
-                # 拼接单个示例字符串
-                example_str = f"# {input_text} <label> {output_text} </label>\n"
-                examples_str += example_str
-            else:
-                # 超过长度限制，返回已拼接的示例和已选数量
-                return examples_str
+            length = input_tokens + output_tokens
+
+            if length + token_num > target_length:
+                break
+
+            token_num += (length + 7)
+            examples_str += f"# {input_text} <label> {output_text} </label>\n"
         except KeyError as e:
-            print(f"警告：示例{i}缺少键{e}，跳过该示例")
+            print(f"Warning: example {i} missing key {e}, skipped")
             continue
-    # 遍历完所有示例且未超长度，返回完整拼接结果
+
     return examples_str
 
 
