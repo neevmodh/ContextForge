@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from method import build_prompt, build_prompt_with_reasoning, count_answer
 from qwen_model import QwenModelLoader
+from self_consistency import get_best_output, get_best_output_with_confidence
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -64,12 +65,50 @@ def _fit_prompt_to_budget(
     return prompt_builder(truncated_input, []) if use_reasoning else build_prompt(truncated_input, [])
 
 
-def _predict_from_prompt(model_loader: QwenModelLoader, prompt: str, max_new_tokens: int) -> str:
-    raw = model_loader.generate_response(prompt, max_new_tokens=max_new_tokens)
-    parsed = count_answer(raw)
-    if parsed is None:
-        return raw.strip()
-    return str(parsed).strip()
+def _predict_from_prompt(
+    model_loader: QwenModelLoader,
+    prompt: str,
+    max_new_tokens: int,
+    use_self_consistency: bool = False,
+    return_confidence: bool = False,
+) -> str | tuple[str, float]:
+    """Generate prediction, optionally using self-consistency voting.
+    
+    Args:
+        model_loader: Model loader instance
+        prompt: Input prompt
+        max_new_tokens: Max tokens to generate
+        use_self_consistency: If True, run 3x and majority vote
+        return_confidence: If True with self-consistency, return (output, confidence)
+    
+    Returns:
+        Best prediction, optionally with confidence score
+    """
+    if use_self_consistency:
+        if return_confidence:
+            raw, confidence = get_best_output_with_confidence(
+                prompt,
+                num_samples=3,
+                model_loader=model_loader,
+                max_new_tokens=max_new_tokens,
+            )
+            parsed = count_answer(raw)
+            final_output = str(parsed).strip() if parsed is not None else raw.strip()
+            return final_output, confidence
+        else:
+            raw = get_best_output(
+                prompt,
+                num_samples=3,
+                model_loader=model_loader,
+                max_new_tokens=max_new_tokens,
+            )
+            parsed = count_answer(raw)
+            return str(parsed).strip() if parsed is not None else raw.strip()
+    else:
+        raw = model_loader.generate_response(prompt, max_new_tokens=max_new_tokens)
+        parsed = count_answer(raw)
+        final_output = str(parsed).strip() if parsed is not None else raw.strip()
+        return final_output if not return_confidence else (final_output, 1.0)
 
 
 def run_all_datasets(
@@ -79,6 +118,7 @@ def run_all_datasets(
     max_prompt_tokens: int,
     max_new_tokens: int,
     use_reasoning: bool = False,
+    use_self_consistency: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_files = _iter_dataset_files(data_dir)
@@ -112,15 +152,28 @@ def run_all_datasets(
                     max_prompt_tokens=max_prompt_tokens,
                     use_reasoning=use_reasoning,
                 )
-                prediction = _predict_from_prompt(
+                result = _predict_from_prompt(
                     model_loader=model_loader,
                     prompt=prompt,
                     max_new_tokens=max_new_tokens,
+                    use_self_consistency=use_self_consistency,
+                    return_confidence=use_self_consistency,
                 )
+
+                if use_self_consistency:
+                    prediction, confidence = result
+                    output_record = {
+                        "id": sample_id,
+                        "prediction": prediction,
+                        "confidence": round(confidence, 3),
+                    }
+                else:
+                    prediction = result
+                    output_record = {"id": sample_id, "prediction": prediction}
 
                 writer.write(
                     json.dumps(
-                        {"id": sample_id, "prediction": prediction},
+                        output_record,
                         ensure_ascii=False,
                     )
                     + "\n"
@@ -164,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable multi-step reasoning mode with chain-of-thought prompting",
     )
+    parser.add_argument(
+        "--use-self-consistency",
+        action="store_true",
+        help="Enable self-consistency voting: run model 3x per input and majority vote",
+    )
     return parser.parse_args()
 
 
@@ -176,4 +234,5 @@ if __name__ == "__main__":
         max_prompt_tokens=args.max_prompt_tokens,
         max_new_tokens=args.max_new_tokens,
         use_reasoning=args.use_reasoning,
+        use_self_consistency=args.use_self_consistency,
     )
