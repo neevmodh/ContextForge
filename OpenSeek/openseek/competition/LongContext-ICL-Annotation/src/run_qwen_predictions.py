@@ -13,6 +13,7 @@ from typing import Any
 
 from tqdm import tqdm
 
+from long_context_optimizer import compress_for_long_context, get_compression_ratio
 from method import build_prompt, build_prompt_with_reasoning, count_answer
 from qwen_model import QwenModelLoader
 from self_consistency import get_best_output, get_best_output_with_confidence
@@ -43,8 +44,30 @@ def _fit_prompt_to_budget(
     examples: list[dict[str, Any]],
     max_prompt_tokens: int,
     use_reasoning: bool = False,
+    optimize_long_context: bool = False,
 ) -> str:
-    """Create an ICL prompt that fits token budget by reducing examples/truncating input."""
+    """Create an ICL prompt that fits token budget by reducing examples/truncating input.
+    
+    Args:
+        tokenizer: Tokenizer for token counting
+        input_text: Input text to annotate
+        examples: In-context learning examples
+        max_prompt_tokens: Token budget limit
+        use_reasoning: Enable chain-of-thought reasoning
+        optimize_long_context: Apply compression for long inputs
+    """
+    # Apply long-context optimization if enabled
+    if optimize_long_context and len(input_text) > 1000:
+        input_text = compress_for_long_context(
+            input_text,
+            query=" ".join(str(ex.get("input", "")) for ex in examples[:2]),
+            max_tokens=max_prompt_tokens // 2,
+            tokenizer=tokenizer,
+            remove_boilerplate_flag=True,
+            extract_key_flag=True,
+            aggressive=False,
+        )
+    
     prompt_builder = build_prompt_with_reasoning if use_reasoning else build_prompt
     
     for k in (3, 2, 1, 0):
@@ -119,6 +142,7 @@ def run_all_datasets(
     max_new_tokens: int,
     use_reasoning: bool = False,
     use_self_consistency: bool = False,
+    optimize_long_context: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_files = _iter_dataset_files(data_dir)
@@ -151,6 +175,7 @@ def run_all_datasets(
                     examples=examples,
                     max_prompt_tokens=max_prompt_tokens,
                     use_reasoning=use_reasoning,
+                    optimize_long_context=optimize_long_context,
                 )
                 result = _predict_from_prompt(
                     model_loader=model_loader,
@@ -222,6 +247,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable self-consistency voting: run model 3x per input and majority vote",
     )
+    parser.add_argument(
+        "--optimize-long-context",
+        action="store_true",
+        help="Enable long-context optimization: remove boilerplate and extract key content",
+    )
     return parser.parse_args()
 
 
@@ -235,4 +265,5 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         use_reasoning=args.use_reasoning,
         use_self_consistency=args.use_self_consistency,
+        optimize_long_context=args.optimize_long_context,
     )

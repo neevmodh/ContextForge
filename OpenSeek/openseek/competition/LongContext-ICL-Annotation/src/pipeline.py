@@ -18,6 +18,7 @@ def main(
     max_new_tokens: int = 256,
     use_reasoning: bool = False,
     use_self_consistency: bool = False,
+    optimize_long_context: bool = False,
     skip_prediction: bool = False,
 ) -> None:
     """Run full pipeline: predict then evaluate.
@@ -30,6 +31,7 @@ def main(
         max_new_tokens: Max tokens to generate
         use_reasoning: Enable chain-of-thought reasoning
         use_self_consistency: Enable voting (3x runs)
+        optimize_long_context: Enable long-context optimization
         skip_prediction: Skip prediction and only evaluate existing results
     """
     # Set defaults
@@ -52,6 +54,7 @@ def main(
         print(f"  Model: {model_name_or_path}")
         print(f"  Reasoning: {'✓' if use_reasoning else '✗'}")
         print(f"  Self-Consistency: {'✓' if use_self_consistency else '✗'}")
+        print(f"  Long-Context Opt: {'✓' if optimize_long_context else '✗'}")
         print(f"  Output dir: {output_dir}\n")
 
         run_all_datasets(
@@ -62,6 +65,7 @@ def main(
             max_new_tokens=max_new_tokens,
             use_reasoning=use_reasoning,
             use_self_consistency=use_self_consistency,
+            optimize_long_context=optimize_long_context,
         )
         print("✓ Predictions completed")
     else:
@@ -165,6 +169,11 @@ if __name__ == "__main__":
         help="Enable self-consistency voting: run model 3x per input and majority vote",
     )
     parser.add_argument(
+        "--optimize-long-context",
+        action="store_true",
+        help="Enable long-context optimization: smart compression and boilerplate removal",
+    )
+    parser.add_argument(
         "--skip-prediction",
         action="store_true",
         help="Skip prediction generation and only evaluate existing results",
@@ -179,5 +188,6 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         use_reasoning=args.use_reasoning,
         use_self_consistency=args.use_self_consistency,
+        optimize_long_context=args.optimize_long_context,
         skip_prediction=args.skip_prediction,
     )
