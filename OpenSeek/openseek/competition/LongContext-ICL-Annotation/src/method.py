@@ -3,6 +3,7 @@ import re
 from collections import Counter
 from transformers import AutoTokenizer
 
+
 """ Here is an example of implementation of Long-Context Data Annotation. """
 
 def build_prompt____(task_description: str, text2annotate: str) -> str:
@@ -46,7 +47,7 @@ def build_prompt____(task_description: str, text2annotate: str) -> str:
     )
     return prompt
 
-def build_prompt(task_description: str, text2annotate: str) -> str:
+def build_prompt_legacy(task_description: str, text2annotate: str) -> str:
     """
     Construct a high-precision prompt for long-context data annotation (optimized for Qwen3-4B).
     task_description: Clear description of the annotation task (e.g., "Classify English product reviews as Good Review/Bad Review").
@@ -82,6 +83,72 @@ def build_prompt(task_description: str, text2annotate: str) -> str:
         "1. You can (and should) provide clear thinking process for your annotation.\n"
         "2. The final annotation result MUST be wrapped in <label> tags (no exceptions).\n"
         "3. All annotation logic must strictly follow the examples provided above.\n"
+    )
+    return prompt
+
+
+def _extract_example_output(example: dict) -> str:
+    """Normalize output fields across dataset variants."""
+    for key in ("label", "labels", "target", "targets", "output", "outputs", "answer"):
+        if key in example:
+            value = example[key]
+            if isinstance(value, list):
+                if not value:
+                    return ""
+                return str(value[0])
+            return str(value)
+    return ""
+
+
+def _select_icl_examples(examples: list[dict], min_count: int = 2, max_count: int = 3) -> list[dict]:
+    """Pick 2-3 examples for ICL; fallback to whatever is available."""
+    valid_examples = [ex for ex in examples if isinstance(ex, dict) and "input" in ex]
+    if not valid_examples:
+        return []
+
+    if len(valid_examples) < min_count:
+        return valid_examples
+    return valid_examples[:max_count]
+
+
+def build_prompt(input_text: str, examples: list[dict] | str) -> str:
+    """Build a structured ICL prompt.
+
+    Primary mode:
+        build_prompt(input_text, examples)
+        - input_text: text to annotate
+        - examples: dataset examples list, each containing input/output-like fields
+
+    Backward-compatible mode:
+        build_prompt(task_description, text2annotate)
+        - If `examples` is passed as a string, this function routes to the
+          legacy task-description prompt builder.
+    """
+    if isinstance(examples, str):
+        return build_prompt_legacy(task_description=input_text, text2annotate=examples)
+
+    chosen_examples = _select_icl_examples(examples)
+    examples_block_lines = []
+    for idx, example in enumerate(chosen_examples, start=1):
+        ex_input = str(example.get("input", "")).strip()
+        ex_output = _extract_example_output(example).strip()
+        examples_block_lines.append(
+            f"Example {idx}:\n"
+            f"Input: {ex_input}\n"
+            f"Output: {ex_output}"
+        )
+
+    examples_block = "\n\n".join(examples_block_lines) if examples_block_lines else "(No examples provided)"
+
+    prompt = (
+        "### Instruction\n"
+        "You are a data annotation assistant. Learn from the provided in-context examples and "
+        "produce the best output for the given input using the same style and format.\n\n"
+        "### Examples\n"
+        f"{examples_block}\n\n"
+        "### Input\n"
+        f"{input_text}\n\n"
+        "### Output\n"
     )
     return prompt
 
