@@ -253,6 +253,81 @@ def build_prompt(input_text: str, examples: list[dict] | str) -> str:
     )
     return prompt
 
+
+def build_prompt_with_reasoning(
+    input_text: str,
+    examples: list[dict[str, Any]] | None = None,
+    task_instruction: str = "",
+) -> str:
+    """Build a prompt that encourages multi-step chain-of-thought reasoning.
+
+    Structure:
+    1. Task instruction
+    2. In-context examples (if provided)
+    3. Explicit reasoning steps:
+       - Step 1: Extract key information
+       - Step 2: Analyze context
+       - Step 3: Generate final annotation
+
+    This format helps LLMs reason through complex tasks more systematically.
+    """
+    examples = examples or []
+    chosen_examples = _select_icl_examples(examples, min_count=1, max_count=2)
+
+    examples_block_lines = []
+    for idx, example in enumerate(chosen_examples, start=1):
+        ex_input = str(example.get("input", "")).strip()
+        ex_output = _extract_example_output(example).strip()
+        ex_reasoning = example.get("reasoning", "")
+        
+        examples_block_lines.append(
+            f"Example {idx}:\n"
+            f"Input: {ex_input}\n"
+        )
+        if ex_reasoning:
+            examples_block_lines[-1] += f"Reasoning Process: {ex_reasoning}\n"
+        examples_block_lines[-1] += f"Output: {ex_output}"
+
+    examples_block = "\n\n".join(examples_block_lines) if examples_block_lines else ""
+
+    prompt = (
+        "### Task Instruction\n"
+    )
+    if task_instruction:
+        prompt += f"{task_instruction}\n\n"
+    else:
+        prompt += (
+            "You are a data annotation expert. Your task is to carefully analyze the given input "
+            "and produce a precise annotation following the provided examples.\n\n"
+        )
+
+    if examples_block:
+        prompt += (
+            "### In-Context Examples (Learn from these)\n"
+            f"{examples_block}\n\n"
+        )
+
+    prompt += (
+        "### Text to Annotate\n"
+        f"{input_text}\n\n"
+        "### Reasoning and Annotation Process\n"
+        "Please work through the following steps to produce your annotation:\n\n"
+        "**Step 1: Extract Key Information**\n"
+        "- Identify the core content, entities, sentiment, or relevant attributes from the input.\n"
+        "- Note any important patterns or keywords that relate to the annotation task.\n\n"
+        "**Step 2: Analyze Context**\n"
+        "- Compare the extracted information against the patterns shown in the examples above.\n"
+        "- Determine which example(s) are most similar and why.\n"
+        "- Consider any edge cases or special context that might affect the annotation.\n\n"
+        "**Step 3: Generate Final Annotation**\n"
+        "- Based on your analysis, produce the final annotation in the same format as the examples.\n"
+        "- Ensure your output follows the structure and style of the in-context examples.\n"
+        "- Wrap your final answer in <label> tags: <label>your annotation</label>\n\n"
+        "### Your Response\n"
+        "Please proceed with the three-step reasoning process above, then provide your final annotation:\n"
+    )
+    return prompt
+
 def build_prompt_backup(task_description:str, text2annotate:str)->str:
     """
         Construct the prompt for annotation based on the task description.

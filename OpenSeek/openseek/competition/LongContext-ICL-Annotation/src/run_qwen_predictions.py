@@ -13,7 +13,7 @@ from typing import Any
 
 from tqdm import tqdm
 
-from method import build_prompt, count_answer
+from method import build_prompt, build_prompt_with_reasoning, count_answer
 from qwen_model import QwenModelLoader
 
 
@@ -41,21 +41,27 @@ def _fit_prompt_to_budget(
     input_text: str,
     examples: list[dict[str, Any]],
     max_prompt_tokens: int,
+    use_reasoning: bool = False,
 ) -> str:
     """Create an ICL prompt that fits token budget by reducing examples/truncating input."""
+    prompt_builder = build_prompt_with_reasoning if use_reasoning else build_prompt
+    
     for k in (3, 2, 1, 0):
-        prompt = build_prompt(input_text, examples[:k])
+        if use_reasoning:
+            prompt = prompt_builder(input_text, examples[:k] if k > 0 else [])
+        else:
+            prompt = prompt_builder(input_text, examples[:k])
         if _token_count(tokenizer, prompt) <= max_prompt_tokens:
             return prompt
 
     # If prompt is still too long without examples, truncate the input text.
-    minimal_prompt = build_prompt("", [])
+    minimal_prompt = prompt_builder("", []) if use_reasoning else build_prompt("", [])
     overhead = _token_count(tokenizer, minimal_prompt)
     available = max(64, max_prompt_tokens - overhead)
     input_ids = tokenizer.encode(input_text, add_special_tokens=False)
     truncated_ids = input_ids[:available]
     truncated_input = tokenizer.decode(truncated_ids, skip_special_tokens=True)
-    return build_prompt(truncated_input, [])
+    return prompt_builder(truncated_input, []) if use_reasoning else build_prompt(truncated_input, [])
 
 
 def _predict_from_prompt(model_loader: QwenModelLoader, prompt: str, max_new_tokens: int) -> str:
@@ -72,6 +78,7 @@ def run_all_datasets(
     model_name_or_path: str,
     max_prompt_tokens: int,
     max_new_tokens: int,
+    use_reasoning: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_files = _iter_dataset_files(data_dir)
@@ -103,6 +110,7 @@ def run_all_datasets(
                     input_text=input_text,
                     examples=examples,
                     max_prompt_tokens=max_prompt_tokens,
+                    use_reasoning=use_reasoning,
                 )
                 prediction = _predict_from_prompt(
                     model_loader=model_loader,
@@ -151,6 +159,11 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Maximum generated tokens for each sample",
     )
+    parser.add_argument(
+        "--use-reasoning",
+        action="store_true",
+        help="Enable multi-step reasoning mode with chain-of-thought prompting",
+    )
     return parser.parse_args()
 
 
@@ -162,4 +175,5 @@ if __name__ == "__main__":
         model_name_or_path=args.model_name_or_path,
         max_prompt_tokens=args.max_prompt_tokens,
         max_new_tokens=args.max_new_tokens,
+        use_reasoning=args.use_reasoning,
     )
